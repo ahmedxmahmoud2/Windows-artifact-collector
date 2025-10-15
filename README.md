@@ -34,6 +34,3 @@ Disclaimer
 This tool is intended for legitimate forensic and incident response purposes only. The author is not responsible for any misuse or unauthorized application.
 
 <img width="1897" height="1062" alt="image" src="https://github.com/user-attachments/assets/791af572-f16f-493e-8f77-cbb8da784e7d" />
-
-<img width="1429" height="732" alt="image" src="https://github.com/user-attachments/assets/8159bbfd-7c86-4d7b-8f66-48397e90d2f2" />
-
