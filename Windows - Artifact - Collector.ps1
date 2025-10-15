@@ -174,40 +174,44 @@ Write-Progress -Activity "Copying Raw Logs" -Completed
 Log-Info "Parsing event logs (parallel)."
 $since = (Get-Date).AddDays(-1 * $LookbackDays)
 $evtxFiles = Get-ChildItem -Path $LogsOut -Filter *.evtx -File -Recurse -ErrorAction SilentlyContinue
-$logonEvents=@(); $logoffEvents=@(); $procEvents=@(); $psEvents=@(); $privEvents=@()
+$logonEvents = New-Object System.Collections.Concurrent.ConcurrentBag[PSObject]
+$logoffEvents = New-Object System.Collections.Concurrent.ConcurrentBag[PSObject]
+$procEvents = New-Object System.Collections.Concurrent.ConcurrentBag[PSObject]
+$psEvents = New-Object System.Collections.Concurrent.ConcurrentBag[PSObject]
+$privEvents = New-Object System.Collections.Concurrent.ConcurrentBag[PSObject]
 $eventIdsToParse = @(4624,4634,4647,4688,4104,1102,7045,4697,4625,4672,4673)
 
 Write-Progress -Activity "Parsing Events" -Status "Starting" -PercentComplete 0
 $evtxFiles | ForEach-Object -Parallel {
     # Import functions for parallel scope
-    function Log-Warn { param($m) $t=(Get-Date).ToString('s'); "$t`t[WARN] $m" | Tee-Object -FilePath $using:LogFile -Append; Write-Host $m -ForegroundColor Yellow }
+    function Log-Warn { param($m) $t=(Get-Date).ToString('s'); "$t`t[WARN] $m" | Tee-Object -FilePath $using:global:LogFile -Append; Write-Host $m -ForegroundColor Yellow }
 
     $filter = @{ Path = $_.FullName; StartTime = $using:since; ID = $using:eventIdsToParse }
     try {
         $events = Get-WinEvent -FilterHashtable $filter -ErrorAction SilentlyContinue
-        $localLogon = $using:logonEvents
-        $localLogoff = $using:logoffEvents
-        $localProc = $using:procEvents
-        $localPs = $using:psEvents
-        $localPriv = $using:privEvents
         foreach ($e in $events) {
             $map = @{}
             try { $xml = [xml]$e.ToXml(); $nodes = $xml.Event.EventData.Data; if ($nodes) { foreach ($n in $nodes) { $nm = $n.Name; if (-not $nm) { $nm = "Field$((Get-Random) -as [int])"}; $map[$nm] = $n.'#text' } } } catch {}
             $rec = [PSCustomObject]@{ TimeCreated = $e.TimeCreated; Id = $e.Id; Provider = $e.ProviderName; Message = ($e.Message -replace "`r`n"," ") -replace "\s{2,}"," "; Data = $map; SourceFile = $_.Name }
             switch ($e.Id) {
-                4624 { $localLogon += $rec }
-                { $_ -in @(4634,4647) } { $localLogoff += $rec }
-                4688 { $localProc += $rec }
-                4104 { $localPs += $rec }
-                { $_ -in @(4672,4673) } { $localPriv += $rec }
+                4624 { ($using:logonEvents).Add($rec) }
+                { $_ -in @(4634,4647) } { ($using:logoffEvents).Add($rec) }
+                4688 { ($using:procEvents).Add($rec) }
+                4104 { ($using:psEvents).Add($rec) }
+                { $_ -in @(4672,4673) } { ($using:privEvents).Add($rec) }
                 default { }
             }
         }
-        # Note: In parallel, we can't directly add to shared arrays; this is a limitation. For simplicity, collect locally and merge after.
-        # In practice, use ConcurrentBag for shared collections.
     } catch { Log-Warn "Get-WinEvent fast filter failed for $($_.Name): $_" }
 } -ThrottleLimit 4
 Write-Progress -Activity "Parsing Events" -Completed
+
+# Convert to arrays
+$logonEvents = $logonEvents.ToArray()
+$logoffEvents = $logoffEvents.ToArray()
+$procEvents = $procEvents.ToArray()
+$psEvents = $psEvents.ToArray()
+$privEvents = $privEvents.ToArray()
 Log-Info ("Collected events: logons={0}, logoffs={1}, proc={2}, ps={3}, priv={4}" -f $logonEvents.Count, $logoffEvents.Count, $procEvents.Count, $psEvents.Count, $privEvents.Count)
 
 # -------------------- Build sessions and durations --------------------
@@ -244,7 +248,7 @@ foreach ($s in $sessions) {
     if ($s.DurationSeconds -lt 60) { $flags += "SHORT(<60s)" }
     if ($s.DurationSeconds -gt (24*3600)) { $flags += "LONG(>24h)" }
     if ($s.LogonType) { [int]$lt=0; if ([int]::TryParse($s.LogonType,[ref]$lt)) { if ($lt -in 3,8,9,10) { $flags += "LOGON_TYPE_$lt" } } }
-    if ($s.IP -and $s.IP -notmatch "^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)") { $flags += "NON_LOCAL_IP" }  # Lateral movement
+    if ($s.IP -and $s.IP -notmatch "^(10\.|192\.168\.|172\.|127\.0\.0\.1|::1)") { $flags += "NON_LOCAL_IP" }  # Lateral movement, exclude local
     $h = $s.StartTime.Hour
     if ($h -lt 5 -or $h -gt 22) { $flags += "ODD_HOUR" }
     if ($flags.Count -gt 0) { $s.Notes += ($flags -join ";"); $sessionSusp += $s }
@@ -359,7 +363,7 @@ Write-Progress -Activity "Correlating Network" -Completed
 # Reverse DNS
 $netResolution = @()
 try {
-    $extips = ($netCorrelated | Where-Object { $_.RemoteAddress -and $_.RemoteAddress -notmatch "^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)" } | Select-Object -ExpandProperty RemoteAddress -Unique)
+    $extips = ($netCorrelated | Where-Object { $_.RemoteAddress -and $_.RemoteAddress -notmatch "^(10\.|192\.168\.|172\.|127\.0\.0\.1|::1)" } | Select-Object -ExpandProperty RemoteAddress -Unique)
     $totalIps = $extips.Count; $i = 0
     foreach ($ip in $extips) {
         $i++
@@ -634,15 +638,21 @@ $lines += "[PowerShell suspicious scriptblocks]"
 $psSus = $psParsed | Where-Object { $_.Suspicious -eq $true } | Sort-Object TimeCreated -Descending
 if ($psSus.Count -gt 0) { foreach ($pe in $psSus) { $snippet = if ($pe.ScriptBlockText) { ($pe.ScriptBlockText -replace "[\r\n]+"," ") -replace "\s{2,}"," " } else { "<no-script-text>" }; $lines += ("Time: {0} | User: {1} | Snippet: {2}" -f $pe.TimeCreated, $pe.User, ($snippet.Substring(0,[math]::Min(800,$snippet.Length)))) } } else { $lines += "No suspicious PowerShell scriptblocks found." }
 $lines += ""
-$lines += "[Network suspicious connections]"
-try {
-    $netCorrFile = Join-Path $NetOut "TCPConnections_Correlated.csv"
-    if (Test-Path $netCorrFile) {
-        $netCorr = Import-Csv -Path $netCorrFile -ErrorAction SilentlyContinue
-        $remoteSusp = $netCorr | Where-Object { $_.RemoteAddress -and $_.RemoteAddress -notmatch "^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)" }
-        if ($remoteSusp.Count -gt 0) { foreach ($n in $remoteSusp) { $lines += ("PID: {0} | Proc: {1} | Remote: {2}:{3} | State: {4}" -f $n.OwningProcess, $n.ProcessName, $n.RemoteAddress, $n.RemotePort, $n.State) } } else { $lines += "No notable remote connections found." }
-    } else { $lines += "No correlated TCP connections file found." }
-} catch { $lines += "Network correlation failed: $_" }
+$lines += "[Browser History Analysis]"
+$histFiles = Get-ChildItem -Path $ParsedOut -Filter "*History_top_urls.csv" -File -ErrorAction SilentlyContinue
+if ($histFiles.Count -gt 0) { 
+    foreach ($h in $histFiles) { 
+        $lines += "History from $($h.BaseName):"
+        Import-Csv $h.FullName | Select-Object -First 10 | ForEach-Object { $lines += "URL: $($_.url) | Title: $($_.title) | Visits: $($_.visit_count) | Last Visit: $($_.last_visit_time)" } 
+        $lines += ""
+    } 
+} else { $lines += "No browser history data available." }
+$lines += ""
+$lines += "[Event Log Analysis (Standard Events)]"
+$standardEvents = $logonEvents + $logoffEvents + $procEvents + $psEvents
+if ($standardEvents.Count -gt 0) { 
+    $standardEvents | Sort-Object TimeCreated -Descending | Select-Object -First 20 | ForEach-Object { $lines += "Time: $($_.TimeCreated) | ID: $($_.Id) | Message: $($_.Message)" } 
+} else { $lines += "No standard events found." }
 $lines += ""
 $lines += "[Summary counts]"
 $lines += ("Event files exported: {0}" -f (Get-ChildItem -Path $LogsOut -Filter *.evtx -File -Recurse -ErrorAction SilentlyContinue).Count)
@@ -710,5 +720,4 @@ Write-Progress -Activity "Compressing Output" -Completed
 
 Log-Info "Collection & analysis finished. Output folder: $OutRoot"
 "=== Forensic Analyzer Collector finished: $((Get-Date).ToString('o')) ===" | Out-File -FilePath $global:LogFile -Append -Encoding utf8
-
 Start-Process $OutRoot
