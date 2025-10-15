@@ -1,6 +1,6 @@
 <#
-Forensic_Analyzer_Collector_vFinal_Improved.ps1
-All-in-one collector + initial analysis (PowerShell only, improved).
+Forensic_Analyzer_Collector.ps1
+All-in-one collector + initial analysis (PowerShell only).
 No external tools required for basic parsing.
 Run as Administrator.
 #>
@@ -710,4 +710,5 @@ Write-Progress -Activity "Compressing Output" -Completed
 
 Log-Info "Collection & analysis finished. Output folder: $OutRoot"
 "=== Forensic Analyzer Collector finished: $((Get-Date).ToString('o')) ===" | Out-File -FilePath $global:LogFile -Append -Encoding utf8
+
 Start-Process $OutRoot
